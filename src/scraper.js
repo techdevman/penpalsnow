@@ -1,12 +1,13 @@
 /**
- * PenpalsNow scraper – loads JS-rendered pages, clicks "show e-mail" links, scrapes emails + ad data.
+ * PenpalsNow scraper – fetch HTML, parse a.showemail.ppadvaluebold for ids,
+ * get emails via GET https://www.penpalsnow.com/_api/showemail.php?e={id}
+ * No Puppeteer. Pagination via form submit (Next 5 pen pal ads).
+ *
  * Usage: node src/scraper.js [country] [sex]
- *   country: AU | CA | US | UK  (default: AU)
- *   sex: male | female          (default: male)
  * Output: Excel file e.g. output/AUmale.xlsx
  */
 
-import puppeteer from 'puppeteer';
+import * as cheerio from 'cheerio';
 import * as XLSX from 'xlsx';
 import { mkdir } from 'fs/promises';
 import { dirname, join } from 'path';
@@ -15,16 +16,23 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, '..', 'output');
 
-const BASE = 'https://www.penpalsnow.com/ads/sexcountry';
-const SHOW_EMAIL_SELECTOR = 'a.showemail.ppadvaluebold';
-const NEXT_BUTTON_SELECTOR = 'input.button[type="submit"][value="Next 5 pen pal ads"]';
+const BASE = 'https://www.penpalsnow.com';
+const LISTING_PATH = '/ads/sexcountry';
+const SHOWEMAIL_API = `${BASE}/_api/showemail.php`;
 const ADS_PER_PAGE = 5;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function buildUrl(country, sex) {
+const DEFAULT_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+function buildListingUrl(country, sex) {
   const c = (country || 'AU').toUpperCase();
   const s = (sex || 'male').toLowerCase();
-  return `${BASE}/${c}${s}.html`;
+  return `${BASE}${LISTING_PATH}/${c}${s}.html`;
 }
 
 function delay(ms) {
@@ -32,134 +40,149 @@ function delay(ms) {
 }
 
 /**
- * Click the "show email" link and wait until the element reveals an email (text or mailto href).
+ * Fetch email for a given showemail id from the API.
  */
-async function revealAndGetEmail(page, linkHandle) {
-  const id = await linkHandle.evaluate((el) => el.id || null);
-  await linkHandle.click();
-  await delay(400);
-
-  const result = await page.evaluate((selectorId) => {
-    const el = selectorId ? document.getElementById(selectorId) : document.querySelector('a.showemail.ppadvaluebold');
-    if (!el) return null;
-    const text = (el.textContent || '').trim();
-    const href = (el.getAttribute('href') || '').trim();
-    if (href.startsWith('mailto:')) return href.replace(/^mailto:/i, '').trim();
-    if (text && text.includes('@') && !text.includes('Hidden')) return text;
-    return null;
-  }, id);
-
-  return result;
+async function fetchEmail(id) {
+  const url = `${SHOWEMAIL_API}?e=${encodeURIComponent(id)}`;
+  const res = await fetch(url, { headers: DEFAULT_HEADERS });
+  const text = await res.text();
+  const trimmed = (text || '').trim();
+  if (trimmed.match(EMAIL_REGEX)) return trimmed;
+  try {
+    const json = JSON.parse(trimmed);
+    if (json.email) return json.email;
+    if (typeof json === 'string' && json.match(EMAIL_REGEX)) return json;
+  } catch (_) {}
+  return null;
 }
 
 /**
- * Extract ad fields from an ad block element (name, gender, age, city/country, hobbies, message).
+ * Extract ad fields from an ad block element (cheerio).
  */
-async function getAdFields(page, adBlock) {
-  return await adBlock.evaluate((block) => {
-    const text = block.innerText || '';
-    const getLabel = (label) => {
-      const re = new RegExp(`${label}:\\s*([^\\n]+)`, 'i');
-      const m = text.match(re);
-      return m ? m[1].trim() : null;
-    };
-    return {
-      name: getLabel('Name'),
-      gender: getLabel('Gender'),
-      ageGroup: getLabel('Age Group'),
-      cityCountry: getLabel('City & Country'),
-      hobbies: getLabel('Hobbies'),
-      message: getLabel('Penpal message') || getLabel('Penpal message / wishes'),
-      lastModified: getLabel('Last modified'),
-    };
-  });
+function getAdFieldsFromBlock($, block) {
+  const text = $(block).text() || '';
+  const getLabel = (label) => {
+    const re = new RegExp(`${label}:\\s*([^\\n]+)`, 'i');
+    const m = text.match(re);
+    return m ? m[1].trim() : null;
+  };
+  return {
+    name: getLabel('Name'),
+    gender: getLabel('Gender'),
+    ageGroup: getLabel('Age Group'),
+    cityCountry: getLabel('City & Country'),
+    hobbies: getLabel('Hobbies'),
+    message: getLabel('Penpal message') || getLabel('Penpal message / wishes'),
+    lastModified: getLabel('Last modified'),
+  };
 }
 
 /**
- * Scrape ads from the current page only (up to ADS_PER_PAGE).
- * Re-queries "show email" links before each ad so handles stay valid after DOM updates from clicks.
+ * Parse one page HTML: get all a.showemail.ppadvaluebold ids and their ad blocks.
  */
-async function scrapeCurrentPage(page, options = {}) {
-  const { clickDelayMs = 500 } = options;
+function parsePage(html) {
+  const $ = cheerio.load(html);
   const ads = [];
-
-  for (let i = 0; i < ADS_PER_PAGE; i++) {
-    const showEmailLinks = await page.$$(SHOW_EMAIL_SELECTOR);
-    if (i >= showEmailLinks.length) break;
-    const link = showEmailLinks[i];
-    const adBlock = await link.evaluateHandle((el) => {
-      let node = el.closest('table') || el.closest('div') || el.parentElement;
-      while (node && !node.querySelector('a.showemail')) node = node.parentElement;
-      return node ? node.closest('table') || node : el.closest('table') || el.parentElement?.parentElement;
-    });
-    const adFields = await getAdFields(page, adBlock);
-    let email = null;
-    try {
-      email = await revealAndGetEmail(page, link);
-      if (!email && (adFields.message || '').match(EMAIL_REGEX)) {
-        const m = adFields.message.match(EMAIL_REGEX);
-        if (m) email = m[0];
-      }
-    } catch (e) {
-      console.warn(`Ad ${i + 1} (${adFields.name}): failed to reveal email – ${e.message}`);
-    }
-    ads.push({ ...adFields, email: email || null });
-    await delay(clickDelayMs);
-  }
+  const $links = $('a.showemail.ppadvaluebold');
+  $links.each((i, el) => {
+    if (i >= ADS_PER_PAGE) return;
+    const id = $(el).attr('id');
+    if (!id) return;
+    const $el = $(el);
+    const block = $el.closest('table').length ? $el.closest('table')[0] : $el.parent().parent()[0];
+    const adFields = block ? getAdFieldsFromBlock($, block) : {};
+    ads.push({ id, ...adFields });
+  });
   return ads;
 }
 
 /**
- * Returns true if the "Next 5 pen pal ads" button is present.
+ * Get form data for "Next 5 pen pal ads" if present. Returns null if no next form.
  */
-async function hasNextButton(page) {
-  const el = await page.$(NEXT_BUTTON_SELECTOR);
-  return el !== null;
+function getNextFormData(html, baseUrl) {
+  const $ = cheerio.load(html);
+  const $form = $('input.button[type="submit"][value="Next 5 pen pal ads"]').closest('form');
+  if (!$form.length) return null;
+  const action = $form.attr('action') || '';
+  const method = ($form.attr('method') || 'get').toLowerCase();
+  const url = action.startsWith('http') ? action : new URL(action, baseUrl).href;
+  const params = new URLSearchParams();
+  $form.find('input').each((_, el) => {
+    const name = $(el).attr('name');
+    const type = $(el).attr('type');
+    const val = $(el).attr('value');
+    if (!name) return;
+    params.set(name, val ?? '');
+  });
+  return { url, method, params };
 }
 
 /**
- * Click "Next 5 pen pal ads" and wait for the next page to load.
+ * Fetch one listing page (URL or form submit for next page).
  */
-async function clickNext(page) {
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
-    page.click(NEXT_BUTTON_SELECTOR),
-  ]);
-  await delay(800);
+async function fetchPage(urlOrConfig) {
+  if (typeof urlOrConfig === 'string') {
+    const res = await fetch(urlOrConfig, { headers: DEFAULT_HEADERS });
+    return { html: await res.text(), url: urlOrConfig };
+  }
+  const { url, method, params } = urlOrConfig;
+  if (method === 'post') {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...DEFAULT_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    return { html: await res.text(), url };
+  }
+  const getUrl = params.toString() ? `${url}${url.includes('?') ? '&' : '?'}${params}` : url;
+  const res = await fetch(getUrl, { headers: DEFAULT_HEADERS });
+  return { html: await res.text(), url: getUrl };
 }
 
-async function scrapeAllPages(page, url, options = {}) {
-  const { maxPages = 999, clickDelayMs = 600 } = options;
-  await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-  await delay(1500);
+/**
+ * Scrape one page: parse HTML for ids + ad blocks, then fetch emails from API.
+ */
+async function scrapeCurrentPage(html, pageUrl, options = {}) {
+  const { requestDelayMs = 300 } = options;
+  const adsWithIds = parsePage(html);
+  const results = [];
+  for (const ad of adsWithIds) {
+    const email = await fetchEmail(ad.id);
+    const { id, ...fields } = ad;
+    results.push({ ...fields, email: email || null });
+    await delay(requestDelayMs);
+  }
+  return results;
+}
 
+async function scrapeAllPages(country, sex, options = {}) {
+  const { maxPages = 999, requestDelayMs = 300 } = options;
+  const listingUrl = buildListingUrl(country, sex);
   const allAds = [];
   let pageNum = 1;
+  let nextRequest = listingUrl;
 
-  while (true) {
-    const ads = await scrapeCurrentPage(page, { clickDelayMs });
+  while (pageNum <= maxPages) {
+    const { html } = await fetchPage(nextRequest);
+    await delay(400);
+    const ads = await scrapeCurrentPage(html, listingUrl, { requestDelayMs });
     allAds.push(...ads);
     console.log(`Page ${pageNum}: ${ads.length} ads (total: ${allAds.length})`);
+    if (ads.length === 0) break;
 
-    if (pageNum >= maxPages) break;
-    const hasNext = await hasNextButton(page);
-    if (!hasNext || ads.length === 0) break;
-
-    await clickNext(page);
+    const nextForm = getNextFormData(html, BASE);
+    if (!nextForm) break;
+    nextRequest = nextForm;
     pageNum++;
   }
 
   return allAds;
 }
 
-/**
- * Write ads to an Excel file. Filename e.g. AUmale.xlsx in output/ folder.
- */
-function writeExcel(ads, country, sex) {
+function getExcelPath(country, sex) {
   const c = (country || 'AU').toUpperCase();
   const s = (sex || 'male').toLowerCase();
-  const filename = `${c}${s}.xlsx`;
-  return join(OUTPUT_DIR, filename);
+  return join(OUTPUT_DIR, `${c}${s}.xlsx`);
 }
 
 async function saveToExcel(ads, filePath) {
@@ -173,30 +196,15 @@ async function saveToExcel(ads, filePath) {
 async function main() {
   const country = process.argv[2] || 'AU';
   const sex = process.argv[3] || 'male';
-  const url = buildUrl(country, sex);
+  const url = buildListingUrl(country, sex);
 
   console.log(`Scraping: ${url}\n`);
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
-
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-    await page.setViewport({ width: 1280, height: 800 });
-
-    const ads = await scrapeAllPages(page, url, { maxPages: 999, clickDelayMs: 600 });
-    const excelPath = writeExcel(ads, country, sex);
-    await saveToExcel(ads, excelPath);
-    console.log(`\nTotal: ${ads.length} ads`);
-    console.log(`Saved: ${excelPath}`);
-  } finally {
-    await browser.close();
-  }
+  const ads = await scrapeAllPages(country, sex, { maxPages: 999, requestDelayMs: 300 });
+  const excelPath = getExcelPath(country, sex);
+  await saveToExcel(ads, excelPath);
+  console.log(`\nTotal: ${ads.length} ads`);
+  console.log(`Saved: ${excelPath}`);
 }
 
 main().catch((err) => {
