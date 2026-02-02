@@ -8,8 +8,11 @@
  */
 
 import 'dotenv/config';
-import * as XLSX from 'xlsx';
+import { createRequire } from 'module';
 import { readdirSync, existsSync } from 'fs';
+
+const require = createRequire(import.meta.url);
+const XLSX = require('xlsx');
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { sendEmail } from './sendEmail.js';
