@@ -7,6 +7,7 @@
  * Output: Excel file e.g. output/AUmale.xlsx
  */
 
+import axios from 'axios';
 import * as cheerio from 'cheerio';
 import * as XLSX from 'xlsx';
 import { mkdir } from 'fs/promises';
@@ -44,9 +45,12 @@ function delay(ms) {
  */
 async function fetchEmail(id) {
   const url = `${SHOWEMAIL_API}?e=${encodeURIComponent(id)}`;
-  const res = await fetch(url, { headers: DEFAULT_HEADERS });
-  const text = await res.text();
-  const trimmed = (text || '').trim();
+  const res = await axios.get(url, {
+    headers: DEFAULT_HEADERS,
+    responseType: 'text',
+    validateStatus: () => true,
+  });
+  const trimmed = (res.data || '').trim();
   if (trimmed.match(EMAIL_REGEX)) return trimmed;
   try {
     const json = JSON.parse(trimmed);
@@ -121,22 +125,23 @@ function getNextFormData(html, baseUrl) {
  * Fetch one listing page (URL or form submit for next page).
  */
 async function fetchPage(urlOrConfig) {
+  const opts = { headers: DEFAULT_HEADERS, responseType: 'text', validateStatus: () => true };
   if (typeof urlOrConfig === 'string') {
-    const res = await fetch(urlOrConfig, { headers: DEFAULT_HEADERS });
-    return { html: await res.text(), url: urlOrConfig };
+    const res = await axios.get(urlOrConfig, opts);
+    return { html: res.data, url: urlOrConfig };
   }
   const { url, method, params } = urlOrConfig;
   if (method === 'post') {
-    const res = await fetch(url, {
-      method: 'POST',
+    const res = await axios.post(url, params.toString(), {
       headers: { ...DEFAULT_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
+      responseType: 'text',
+      validateStatus: () => true,
     });
-    return { html: await res.text(), url };
+    return { html: res.data, url };
   }
   const getUrl = params.toString() ? `${url}${url.includes('?') ? '&' : '?'}${params}` : url;
-  const res = await fetch(getUrl, { headers: DEFAULT_HEADERS });
-  return { html: await res.text(), url: getUrl };
+  const res = await axios.get(getUrl, opts);
+  return { html: res.data, url: getUrl };
 }
 
 /**
