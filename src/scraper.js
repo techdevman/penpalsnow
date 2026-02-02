@@ -11,6 +11,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import * as XLSX from 'xlsx';
 import { mkdir } from 'fs/promises';
+import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -40,23 +41,49 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const FETCH_EMAIL_RETRIES = 4;
+const FETCH_EMAIL_TIMEOUT_MS = 15000;
+
 /**
- * Fetch email for a given showemail id from the API.
+ * Fetch email for a given showemail id from the API. Retries on ECONNRESET / socket hang up.
  */
 async function fetchEmail(id) {
   const url = `${SHOWEMAIL_API}?e=${encodeURIComponent(id)}`;
-  const res = await axios.get(url, {
+  const opts = {
     headers: DEFAULT_HEADERS,
     responseType: 'text',
     validateStatus: () => true,
-  });
-  const trimmed = (res.data || '').trim();
-  if (trimmed.match(EMAIL_REGEX)) return trimmed;
-  try {
-    const json = JSON.parse(trimmed);
-    if (json.email) return json.email;
-    if (typeof json === 'string' && json.match(EMAIL_REGEX)) return json;
-  } catch (_) {}
+    timeout: FETCH_EMAIL_TIMEOUT_MS,
+  };
+  let lastErr;
+  for (let attempt = 1; attempt <= FETCH_EMAIL_RETRIES; attempt++) {
+    try {
+      const res = await axios.get(url, opts);
+      const trimmed = (res.data || '').trim();
+      if (trimmed.match(EMAIL_REGEX)) return trimmed;
+      try {
+        const json = JSON.parse(trimmed);
+        if (json.email) return json.email;
+        if (typeof json === 'string' && json.match(EMAIL_REGEX)) return json;
+      } catch (_) {}
+      return null;
+    } catch (err) {
+      lastErr = err;
+      const code = err.code || err.cause?.code;
+      const isRetryable =
+        code === 'ECONNRESET' ||
+        code === 'ETIMEDOUT' ||
+        code === 'ECONNABORTED' ||
+        (err.message && /socket hang up|network/i.test(err.message));
+      if (!isRetryable || attempt === FETCH_EMAIL_RETRIES) break;
+      const backoffMs = 1000 * Math.pow(2, attempt - 1);
+      if (attempt > 1) console.warn(`  fetchEmail ${id} attempt ${attempt} failed (${code || err.message}), retry in ${backoffMs}ms`);
+      await delay(backoffMs);
+    }
+  }
+  if (lastErr && FETCH_EMAIL_RETRIES > 1) {
+    console.warn(`  fetchEmail ${id} failed after ${FETCH_EMAIL_RETRIES} attempts: ${lastErr.code || lastErr.message}`);
+  }
   return null;
 }
 
@@ -121,27 +148,63 @@ function getNextFormData(html, baseUrl) {
   return { url, method, params };
 }
 
+const FETCH_PAGE_RETRIES = 4;
+const FETCH_PAGE_TIMEOUT_MS = 30000;
+
+function isRetryableNetworkError(err) {
+  const code = err.code || err.cause?.code;
+  return (
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNABORTED' ||
+    (err.message && /socket hang up|network/i.test(err.message))
+  );
+}
+
 /**
- * Fetch one listing page (URL or form submit for next page).
+ * Fetch one listing page (URL or form submit for next page). Retries on ECONNRESET / socket hang up.
  */
 async function fetchPage(urlOrConfig) {
-  const opts = { headers: DEFAULT_HEADERS, responseType: 'text', validateStatus: () => true };
-  if (typeof urlOrConfig === 'string') {
-    const res = await axios.get(urlOrConfig, opts);
-    return { html: res.data, url: urlOrConfig };
-  }
-  const { url, method, params } = urlOrConfig;
-  if (method === 'post') {
-    const res = await axios.post(url, params.toString(), {
+  const opts = {
+    headers: DEFAULT_HEADERS,
+    responseType: 'text',
+    validateStatus: () => true,
+    timeout: FETCH_PAGE_TIMEOUT_MS,
+  };
+  const doGet = (url) => axios.get(url, opts);
+  const doPost = (url, body) =>
+    axios.post(url, body, {
       headers: { ...DEFAULT_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
       responseType: 'text',
       validateStatus: () => true,
+      timeout: FETCH_PAGE_TIMEOUT_MS,
     });
-    return { html: res.data, url };
+
+  let lastErr;
+  for (let attempt = 1; attempt <= FETCH_PAGE_RETRIES; attempt++) {
+    try {
+      if (typeof urlOrConfig === 'string') {
+        const res = await doGet(urlOrConfig);
+        return { html: res.data, url: urlOrConfig };
+      }
+      const { url, method, params } = urlOrConfig;
+      const body = params.toString();
+      if (method === 'post') {
+        const res = await doPost(url, body);
+        return { html: res.data, url };
+      }
+      const getUrl = body ? `${url}${url.includes('?') ? '&' : '?'}${params}` : url;
+      const res = await doGet(getUrl);
+      return { html: res.data, url: getUrl };
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableNetworkError(err) || attempt === FETCH_PAGE_RETRIES) throw err;
+      const backoffMs = 2000 * Math.pow(2, attempt - 1);
+      console.warn(`  fetchPage attempt ${attempt} failed (${err.code || err.message}), retry in ${backoffMs}ms`);
+      await delay(backoffMs);
+    }
   }
-  const getUrl = params.toString() ? `${url}${url.includes('?') ? '&' : '?'}${params}` : url;
-  const res = await axios.get(getUrl, opts);
-  return { html: res.data, url: getUrl };
+  throw lastErr;
 }
 
 /**
@@ -152,7 +215,12 @@ async function scrapeCurrentPage(html, pageUrl, options = {}) {
   const adsWithIds = parsePage(html);
   const results = [];
   for (const ad of adsWithIds) {
-    const email = await fetchEmail(ad.id);
+    let email = null;
+    try {
+      email = await fetchEmail(ad.id);
+    } catch (err) {
+      console.warn(`  Skipping email for ad ${ad.name} (${ad.id}): ${err.message}`);
+    }
     const { id, ...fields } = ad;
     results.push({ ...fields, email: email || null });
     await delay(requestDelayMs);
@@ -161,14 +229,55 @@ async function scrapeCurrentPage(html, pageUrl, options = {}) {
 }
 
 async function scrapeAllPages(country, sex, options = {}) {
-  const { maxPages = 999, requestDelayMs = 300 } = options;
+  const { maxPages = 9999, requestDelayMs = 300, existingAds = [] } = options;
   const listingUrl = buildListingUrl(country, sex);
-  const allAds = [];
-  let pageNum = 1;
+  const allAds = [...existingAds];
+  let pageNum = existingAds.length > 0 ? Math.floor(existingAds.length / ADS_PER_PAGE) + 1 : 1;
   let nextRequest = listingUrl;
 
+  if (existingAds.length > 0) {
+    console.log(`Resuming: ${existingAds.length} ads already, fast-forwarding to page ${pageNum}...`);
+    let html;
+    try {
+      const result = await fetchPage(listingUrl);
+      html = result.html;
+    } catch (err) {
+      console.warn(`Resume fast-forward failed (could not fetch first page): ${err.message}. Saving ${allAds.length} ads.`);
+      return allAds;
+    }
+    {
+      for (let i = 0; i < pageNum - 1; i++) {
+        const nextForm = getNextFormData(html, BASE);
+        if (!nextForm) break;
+        try {
+          const result = await fetchPage(nextForm);
+          html = result.html;
+        } catch (err) {
+          console.warn(`Fast-forward failed at step ${i + 1}: ${err.message}. Saving ${allAds.length} ads.`);
+          await saveToExcel(allAds, getExcelPath(country, sex));
+          return allAds;
+        }
+        await delay(300);
+      }
+      const ads = await scrapeCurrentPage(html, listingUrl, { requestDelayMs });
+      allAds.push(...ads);
+      console.log(`Page ${pageNum}: ${ads.length} ads (total: ${allAds.length})`);
+      const nextForm = getNextFormData(html, BASE);
+      if (!nextForm) return allAds;
+      nextRequest = nextForm;
+      pageNum++;
+    }
+  }
+
   while (pageNum <= maxPages) {
-    const { html } = await fetchPage(nextRequest);
+    let html;
+    try {
+      const result = await fetchPage(nextRequest);
+      html = result.html;
+    } catch (err) {
+      console.warn(`Page ${pageNum} fetch failed after retries: ${err.message}. Saving ${allAds.length} ads so far.`);
+      break;
+    }
     await delay(400);
     const ads = await scrapeCurrentPage(html, listingUrl, { requestDelayMs });
     allAds.push(...ads);
@@ -190,6 +299,22 @@ function getExcelPath(country, sex) {
   return join(OUTPUT_DIR, `${c}${s}.xlsx`);
 }
 
+/**
+ * Load existing ads from Excel file if it exists. Returns [] if file missing or empty.
+ */
+function loadExistingAds(filePath) {
+  if (!existsSync(filePath)) return [];
+  try {
+    const wb = XLSX.readFile(filePath);
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    if (!ws) return [];
+    const rows = XLSX.utils.sheet_to_json(ws);
+    return Array.isArray(rows) ? rows : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 async function saveToExcel(ads, filePath) {
   await mkdir(OUTPUT_DIR, { recursive: true });
   const ws = XLSX.utils.json_to_sheet(ads);
@@ -202,11 +327,19 @@ async function main() {
   const country = process.argv[2] || 'AU';
   const sex = process.argv[3] || 'male';
   const url = buildListingUrl(country, sex);
+  const excelPath = getExcelPath(country, sex);
+  const existingAds = loadExistingAds(excelPath);
 
   console.log(`Scraping: ${url}\n`);
+  if (existingAds.length > 0) {
+    console.log(`Found existing file: ${existingAds.length} ads. Resuming from next page.\n`);
+  }
 
-  const ads = await scrapeAllPages(country, sex, { maxPages: 999, requestDelayMs: 300 });
-  const excelPath = getExcelPath(country, sex);
+  const ads = await scrapeAllPages(country, sex, {
+    maxPages: 9999,
+    requestDelayMs: 300,
+    existingAds,
+  });
   await saveToExcel(ads, excelPath);
   console.log(`\nTotal: ${ads.length} ads`);
   console.log(`Saved: ${excelPath}`);
