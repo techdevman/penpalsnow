@@ -1,0 +1,20 @@
+{
+  "name": "penpalsnow-scraper",
+  "version": "1.0.0",
+  "description": "Scrape pen pal ads from penpalsnow.com (JS-rendered, click-to-reveal emails)",
+  "type": "module",
+  "main": "src/scraper.js",
+  "scripts": {
+    "scrape": "node src/scraper.js",
+    "scrape:au": "node src/scraper.js AU male",
+    "scrape:ca": "node src/scraper.js CA male",
+    "scrape:us": "node src/scraper.js US male",
+    "scrape:uk": "node src/scraper.js UK male"
+  },
+  "keywords": ["scraper", "penpalsnow", "puppeteer"],
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^24.0.0",
+    "xlsx": "^0.18.5"
+  }
+}
