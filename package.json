@@ -16,14 +16,14 @@
     "scrape:ca": "node src/scraper.js CA male",
     "scrape:us": "node src/scraper.js US male",
     "scrape:uk": "node src/scraper.js UK male",
-    "send-email": "node src/sendEmail.js",
+    "send-email": "node src/sendEmailGmail.js",
     "send-to-excel": "node src/sendToExcelEmails.js"
   },
   "dependencies": {
     "axios": "^1.13.4",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.0",
-    "resend": "^4.8.0",
+    "nodemailer": "^6.10.1",
     "xlsx": "^0.18.5"
   }
 }

@@ -1,10 +1,10 @@
 /**
- * Send emails to addresses in output Excel files via Resend.
+ * Send emails to addresses in output Excel files via Gmail SMTP.
  * Adds/updates "sent" column after each successful send.
- * Limit: 100 emails per run (Resend free tier).
+ * Limit: 100 emails per run.
  *
  * Usage: node src/sendToExcelEmails.js [--max 100] [--files AUmale,CAmale,...]
- * Env: RESEND_API_KEY, SEND_FROM (e.g. "Milos <onboarding@resend.dev>")
+ * Env: GMAIL_USER, APP_PASSWORD (Gmail app password)
  */
 
 import 'dotenv/config';
@@ -15,7 +15,7 @@ const require = createRequire(import.meta.url);
 const XLSX = require('xlsx');
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { sendEmail } from './sendEmail.js';
+import { sendEmailGmail } from './sendEmailGmail.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_DIR = join(__dirname, '..', 'output');
@@ -76,8 +76,6 @@ async function main() {
   const filesArg = getArg('--files');
   const filterFiles = filesArg ? filesArg.split(',').map((f) => f.trim()) : null;
 
-  const from = process.env.SEND_FROM || 'Milos <onboarding@resend.dev>';
-
   const excelFiles = getExcelFiles(filterFiles);
   if (excelFiles.length === 0) {
     console.log('No Excel files found in output/');
@@ -115,8 +113,7 @@ async function main() {
     const email = (row.email || '').trim();
 
     try {
-      await sendEmail({
-        from,
+      await sendEmailGmail({
         to: email,
         subject: EMAIL_SUBJECT,
         text: EMAIL_BODY,
